@@ -1,0 +1,10 @@
+langchain==0.3.25
+langchain-groq==0.3.2        
+langchain-core==0.3.58
+langchain-experimental==0.3.4
+langgraph==0.4.1
+python-dotenv==1.0.1
+pandas==2.2.3
+numpy==2.2.5
+matplotlib==3.10.1
+seaborn==0.13.2
