@@ -3,15 +3,17 @@ Code Writer + Debugger + Documentation Agent
 Using LangChain, LangGraph, and Groq API
 
 Flow:
-  User Prompt → Generate Code → Execute Code → Debug (loop) → Document + Save Code
+  User Prompt → Generate Code → Execute Code (Docker-sandboxed) → Debug (loop) → Document + Save Code
 """
-#WRITEDEDOC
-
 
 import os
 import sys
 import re
 import io
+import shutil
+import subprocess
+import tempfile
+import uuid
 import contextlib
 from datetime import datetime
 from typing import TypedDict
@@ -30,51 +32,127 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
     raise ValueError("❌  GROQ_API_KEY not found. Set it in your .env file.")
 
-MODEL_NAME         = "llama-3.1-8b-instant"   # fast & capable on Groq
-MAX_DEBUG_ITERATIONS = 5
-OUTPUT_DIR         = "output"                  # all artefacts land here
+MODEL_NAME            = "llama-3.1-8b-instant"   # fast & capable on Groq
+MAX_DEBUG_ITERATIONS  = 5
+OUTPUT_DIR            = "output"                  # all artefacts land here
+
+# ── Docker sandbox config ─────────────────────
+DOCKER_IMAGE          = "python:3.11-slim"   # base image used to run generated code
+CONTAINER_TIMEOUT_S   = 10                   # hard wall-clock limit per execution
+CONTAINER_MEM_LIMIT   = "128m"               # memory cap (also caps swap, see below)
+CONTAINER_CPU_LIMIT   = "0.5"                # fraction of a CPU core
+CONTAINER_PIDS_LIMIT  = "64"                 # blocks fork-bombs
 
 
 # ─────────────────────────────────────────────
-# TOOL 1 — Python REPL  (executes code locally)
+# TOOL 1 — Python REPL (Docker-sandboxed execution)
 # ─────────────────────────────────────────────
-def python_repl_tool(code: str) -> dict:
+def _ensure_docker_available() -> None:
+    """Raise a clear error early if Docker isn't installed / running."""
+    if shutil.which("docker") is None:
+        raise RuntimeError(
+            "Docker is not installed or not on PATH. "
+            "Install Docker Desktop / Docker Engine and ensure `docker` "
+            "is runnable from this shell before using python_repl_tool."
+        )
+    try:
+        subprocess.run(
+            ["docker", "info"],
+            capture_output=True, text=True, timeout=5, check=True,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Docker CLI found but the Docker daemon isn't reachable "
+            "(is Docker Desktop / the docker service running?)."
+        ) from exc
+
+
+def python_repl_tool(code: str, timeout: int = CONTAINER_TIMEOUT_S) -> dict:
     """
-    Execute Python code in a sandboxed local namespace.
+    Execute Python code inside an isolated, disposable Docker container.
+
+    Sandboxing measures applied to the container:
+      - --network none        : no network access at all
+      - --memory / --cpus     : hard resource caps
+      - --pids-limit          : blocks fork-bombs
+      - --read-only + tmpfs   : root filesystem is read-only, only /tmp is writable
+      - --cap-drop ALL        : all Linux capabilities dropped
+      - --security-opt no-new-privileges
+      - -u nobody              : runs as an unprivileged, non-root user
+      - --rm                   : container is destroyed immediately after exit
+      - subprocess timeout    : kills a hung container from the host side too
 
     Parameters
     ----------
-    code : str
-        Valid Python source code to execute.
+    code    : str   Valid Python source code to execute.
+    timeout : int   Max seconds to allow the container to run.
 
     Returns
     -------
     dict
         {
           "stdout"  : str,   # anything printed to stdout
-          "stderr"  : str,   # exception message (empty on success)
-          "success" : bool   # True when no exception was raised
+          "stderr"  : str,   # exception / docker error text (empty on success)
+          "success" : bool   # True when the script exited with code 0
         }
     """
-    stdout_buf = io.StringIO()
-    stderr_buf = io.StringIO()
-    namespace  = {}
+    work_dir = tempfile.mkdtemp(prefix="agent_sandbox_")
+    script_path = os.path.join(work_dir, "script.py")
+    container_name = f"agent-sandbox-{uuid.uuid4().hex[:8]}"
 
     try:
-        with contextlib.redirect_stdout(stdout_buf), \
-             contextlib.redirect_stderr(stderr_buf):
-            exec(compile(code, "<agent_code>", "exec"), namespace)
-        return {
-            "stdout":  stdout_buf.getvalue(),
-            "stderr":  stderr_buf.getvalue(),
-            "success": True,
-        }
-    except Exception as exc:
-        return {
-            "stdout":  stdout_buf.getvalue(),
-            "stderr":  f"{type(exc).__name__}: {exc}",
-            "success": False,
-        }
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(code)
+
+        cmd = [
+            "docker", "run",
+            "--rm",
+            "--name", container_name,
+            "--network", "none",
+            "--memory", CONTAINER_MEM_LIMIT,
+            "--memory-swap", CONTAINER_MEM_LIMIT,   # = --memory → disables extra swap
+            "--cpus", CONTAINER_CPU_LIMIT,
+            "--pids-limit", CONTAINER_PIDS_LIMIT,
+            "--read-only",
+            "--tmpfs", "/tmp:size=64m",
+            "--security-opt", "no-new-privileges",
+            "--cap-drop", "ALL",
+            "-v", f"{script_path}:/sandbox/script.py:ro",
+            "-w", "/sandbox",
+            "-u", "nobody",
+            DOCKER_IMAGE,
+            "python3", "-I", "script.py",   # -I = isolated mode (ignores env/user site-packages)
+        ]
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            return {
+                "stdout":  proc.stdout,
+                "stderr":  proc.stderr,
+                "success": proc.returncode == 0,
+            }
+        except subprocess.TimeoutExpired:
+            # Host-side safety net: force-kill the container if it's still alive.
+            subprocess.run(["docker", "kill", container_name], capture_output=True)
+            return {
+                "stdout":  "",
+                "stderr":  f"Execution timed out after {timeout}s (container killed).",
+                "success": False,
+            }
+        except FileNotFoundError:
+            return {
+                "stdout":  "",
+                "stderr":  "Docker is not installed or not on PATH.",
+                "success": False,
+            }
+
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 # ─────────────────────────────────────────────
@@ -170,6 +248,12 @@ def log(step: str, message: str):
 # ─────────────────────────────────────────────
 # GRAPH STATE
 # ─────────────────────────────────────────────
+class AttemptRecord(TypedDict):
+    attempt: int    # attempt number (1-indexed)
+    code:    str    # the code that was tried
+    error:   str    # the error it produced
+
+
 class AgentState(TypedDict):
     user_prompt:      str    # original user task
     current_code:     str    # latest generated / fixed code
@@ -178,6 +262,7 @@ class AgentState(TypedDict):
     final_code:       str    # confirmed-working code
     documentation:    str    # generated markdown docs
     status:           str    # "executing" | "debugging" | "done" | "failed"
+    history:           list  # list[AttemptRecord] — every past (code, error) pair
 
 
 # ─────────────────────────────────────────────
@@ -199,7 +284,9 @@ def generate_code_node(state: AgentState) -> AgentState:
         "Requirements:\n"
         "- Include docstrings on every function\n"
         "- Handle edge cases (empty input, wrong types, etc.)\n"
-        "- Add a small demo / test at the bottom inside `if __name__ == '__main__':`"
+        "- Add a small demo / test at the bottom inside `if __name__ == '__main__':`\n"
+        "- Use only the Python standard library (the code will run in a network-isolated "
+        "sandbox with no ability to pip install third-party packages)"
     ))
 
     log("Action", "Calling LLM (Groq) → generate initial code")
@@ -217,11 +304,11 @@ def generate_code_node(state: AgentState) -> AgentState:
 
 
 # ─────────────────────────────────────────────
-# NODE 2 — Execute code with TOOL 1
+# NODE 2 — Execute code with TOOL 1 (Docker sandbox)
 # ─────────────────────────────────────────────
 def execute_code_node(state: AgentState) -> AgentState:
     log("Action", (
-        f"[TOOL: python_repl_tool] Executing code "
+        f"[TOOL: python_repl_tool] Executing code in Docker sandbox "
         f"(attempt {state['iteration'] + 1})"
     ))
 
@@ -235,7 +322,21 @@ def execute_code_node(state: AgentState) -> AgentState:
     log("Observation", obs)
 
     new_status = "done" if result["success"] else "debugging"
-    return {**state, "execution_result": result, "status": new_status}
+    new_history = state.get("history", [])
+
+    if not result["success"]:
+        new_history = new_history + [{
+            "attempt": state["iteration"] + 1,
+            "code":    state["current_code"],
+            "error":   result.get("stderr", "Unknown error"),
+        }]
+
+    return {
+        **state,
+        "execution_result": result,
+        "status": new_status,
+        "history": new_history,
+    }
 
 
 # ─────────────────────────────────────────────
@@ -252,22 +353,50 @@ def debug_code_node(state: AgentState) -> AgentState:
         return {**state, "iteration": iteration, "status": "failed"}
 
     error_msg = state["execution_result"].get("stderr", "Unknown error")
+    history   = state.get("history", [])
+
     log("Thought", (
         f"Iteration {iteration}: The code produced an error.\n"
         f"Error  : {error_msg}\n"
-        "I will analyse the error and produce a corrected version."
+        f"Past failed attempts on record: {len(history)}\n"
+        "I will review the full history and produce a corrected version that "
+        "avoids repeating any previous mistake."
     ))
+
+    # ── Build a full trail of every past attempt + error ──────────
+    if history:
+        blocks = []
+        for rec in history:
+            blocks.append(
+                f"### Attempt {rec['attempt']}\n"
+                f"```python\n{rec['code']}\n```\n"
+                f"**Resulting error:**\n```\n{rec['error']}\n```"
+            )
+        history_text = "\n\n".join(blocks)
+    else:
+        history_text = "(no prior attempts)"
 
     system = SystemMessage(content=(
         "You are an expert Python debugger. "
+        "You will be shown the FULL history of every attempt made so far, each "
+        "paired with the exact error it produced. Some attempts may share the same "
+        "root cause — do not propose a fix that repeats the approach of any attempt "
+        "already shown to fail, even if it looks slightly different. If two or more "
+        "past attempts failed for related reasons, explicitly address that root "
+        "cause rather than patching the surface symptom again. "
         "Fix the broken code and output ONLY a single ```python ... ``` block. "
-        "No explanations outside the block."
+        "No explanations outside the block. Remember the code runs in a "
+        "network-isolated sandbox with only the Python standard library available."
     ))
     human = HumanMessage(content=(
         f"Original task:\n{state['user_prompt']}\n\n"
-        f"Broken code:\n```python\n{state['current_code']}\n```\n\n"
-        f"Error message:\n{error_msg}\n\n"
-        "Fix the error. Return the COMPLETE corrected code (not just the diff)."
+        f"**Full history of past attempts and their errors (chronological):**\n\n"
+        f"{history_text}\n\n"
+        f"**Most recent (current) broken code:**\n```python\n{state['current_code']}\n```\n\n"
+        f"**Most recent error:**\n{error_msg}\n\n"
+        "Fix the error, taking into account every past attempt above so you do not "
+        "reintroduce a previously-failed approach. Return the COMPLETE corrected "
+        "code (not just the diff)."
     ))
 
     log("Action", f"Calling LLM (Groq) → fix error (attempt {iteration})")
@@ -301,6 +430,17 @@ def generate_docs_node(state: AgentState) -> AgentState:
     # ── Generate rich documentation ───────────
     timestamp   = datetime.now().strftime("%Y-%m-%d")
     debug_iters = state["iteration"]
+    history     = state.get("history", [])
+
+    if history:
+        history_blocks = []
+        for rec in history:
+            history_blocks.append(
+                f"Attempt {rec['attempt']} failed with:\n```\n{rec['error']}\n```"
+            )
+        history_summary = "\n\n".join(history_blocks)
+    else:
+        history_summary = "(code worked on the first attempt — no debugging was needed)"
 
     system = SystemMessage(content=(
         "You are a senior technical writer specialising in Python open-source projects. "
@@ -312,8 +452,10 @@ def generate_docs_node(state: AgentState) -> AgentState:
         f"**Final verified Python code:**\n```python\n{state['current_code']}\n```\n\n"
         f"**Agent metadata:**\n"
         f"- Model used     : {MODEL_NAME}\n"
+        f"- Execution sandbox : Docker ({DOCKER_IMAGE}, network-isolated)\n"
         f"- Debug iterations required: {debug_iters}\n"
         f"- Generated on   : {timestamp}\n\n"
+        f"**Errors encountered during debugging (chronological):**\n\n{history_summary}\n\n"
         "Generate a comprehensive Markdown documentation file with **exactly** these sections "
         "(use the headings verbatim):\n\n"
         "## 📌 Overview\n"
@@ -338,8 +480,13 @@ def generate_docs_node(state: AgentState) -> AgentState:
         "A Markdown table listing every import: Module | Version | Purpose.\n\n"
         "## 🛠️ Agent Execution Log Summary\n"
         f"A short paragraph noting the model ({MODEL_NAME}), "
+        f"that execution happened inside a network-isolated Docker sandbox, "
         f"how many debug iterations were needed ({debug_iters}), "
         f"and the generation date ({timestamp}).\n\n"
+        "## 🐞 Debugging Journey\n"
+        "If there were prior failed attempts, briefly summarise what went wrong at "
+        "each attempt and how the final code fixes it (one short bullet per attempt). "
+        "If the code worked on the first try, state that plainly instead.\n\n"
         "## 📝 Changelog\n"
         f"| Version | Date | Notes |\n"
         f"|---------|------|-------|\n"
@@ -354,6 +501,7 @@ def generate_docs_node(state: AgentState) -> AgentState:
         f"# 📚 Documentation\n\n"
         f"> **Auto-generated** by the Code-Writer + Debugger Agent  \n"
         f"> Model: `{MODEL_NAME}` &nbsp;|&nbsp; "
+        f"Sandbox: `Docker / {DOCKER_IMAGE}` &nbsp;|&nbsp; "
         f"Generated: `{timestamp}` &nbsp;|&nbsp; "
         f"Debug iterations: `{debug_iters}`\n\n"
         f"---\n\n"
@@ -442,9 +590,13 @@ def build_graph():
 def run_agent(user_prompt: str):
     print("\n" + "═"*60)
     print("  CODE WRITER + DEBUGGER + DOCUMENTATION AGENT")
-    print("  Powered by Groq + LangGraph")
+    print("  Powered by Groq + LangGraph  |  Sandboxed via Docker")
     print("═"*60)
     print(f"\n📝  Task: {user_prompt}\n")
+
+    # Fail fast with a clear message if Docker isn't available,
+    # rather than letting every execution attempt error out silently.
+    _ensure_docker_available()
 
     graph = build_graph()
 
@@ -456,6 +608,7 @@ def run_agent(user_prompt: str):
         "final_code":       "",
         "documentation":    "",
         "status":           "executing",
+        "history":          [],
     }
 
     final_state = graph.invoke(initial_state)
