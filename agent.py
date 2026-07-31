@@ -5,6 +5,8 @@ Using LangChain, LangGraph, and Groq API
 Flow:
   User Prompt → Generate Code → Execute Code (Docker-sandboxed) → Debug (loop) → Document + Save Code
 """
+#WRITEDEDOC
+
 
 import os
 import sys
@@ -24,6 +26,20 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 
 load_dotenv()
+
+# ─────────────────────────────────────────────
+# WINDOWS CONSOLE FIX
+# ─────────────────────────────────────────────
+# Windows terminals often default to a legacy codepage (e.g. cp1252) that
+# can't encode the box-drawing characters (═, ─) and emoji used in log()
+# below, causing a UnicodeEncodeError as soon as anything is printed.
+# Reconfiguring stdout/stderr to UTF-8 fixes this regardless of how the
+# script is launched (double-click, IDE, plain `python agent.py`, etc.).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -630,9 +646,8 @@ def run_agent(user_prompt: str):
 
 
 if __name__ == "__main__":
+    pr = input("Enter your code requirements: ")
     prompt = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
-        "Write a Python function that takes a list of numbers and returns "
-        "the mean, median, and mode. Handle edge cases like an empty list "
-        "and multiple modes."
+        pr
     )
     run_agent(prompt)
